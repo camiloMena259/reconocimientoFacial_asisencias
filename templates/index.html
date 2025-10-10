@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sistema de Asistencia con Reconocimiento Facial</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <link rel="stylesheet" href="./static/css/style.css">
+</head>
+
+<body>
+  <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+    <div class="container">
+      <a class="navbar-brand" href="#">
+        <i class="fas fa-users me-2"></i>
+        Sistema de Asistencia con IA
+      </a>
+      <span class="navbar-text">
+        <i class="fas fa-clock me-1"></i>
+        <span id="current-time"></span>
+      </span>
+    </div>
+  </nav>
+
+  <!-- Columna izquierda: Video y reconocimiento -->
+  <div class="container mt-4">
+    <div class="row">
+      <div class="col-md-6 mb-4">
+        <div class="card">
+          <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">
+              <i class="fas fa-camera me-2"></i> Cámara en vivo
+            </h5>
+            <button class="btn btn-sm btn-light" id="restart-camera-btn">
+              <i class="fas fa-sync-alt"></i>
+            </button>
+          </div>
+
+          <div class="card-body p-0">
+            <div class="video-container">
+              <img src="{{ url_for('video_feed') }}" class="video-feed" id="video-feed" alt="Video en vivo" onerror="handleVideoError()">
+              <div class="recognition-overlay">
+                <span id="recognition-message">Esperando reconocimiento...</span>
+              </div>
+            </div>
+
+            <div class="camera-error d-none" id="camera-error">
+              <i class="fas fa-video-slash fa-3x mb-2"></i>
+              <h5>No se puede acceder a la cámara</h5>
+              <p class="text-center">
+                Verifica que la cámara esté conectada y que hayas dado permisos al navegador.
+              </p>
+              <button class="btn btn-primary" onclick="restartCamera()">
+                <i class="fas fa-sync-alt me-2"></i> Reintentar
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mt-4 recognition-card" id="recognition-info">
+          <div class="card-header bg-info text-white">
+            <h5 class="mb-0"><i class="fas fa-user me-2"></i> Reconocimiento actual</h5>
+          </div>
+
+          <div class="card-body">
+            <div id="no-recognition" class="text-center py-4">
+              <i class="fas fa-user-slash fa-3x text-muted mb-2"></i>
+              <h5 class="text-muted">Esperando detectar un rostro...</h5>
+            </div>
+
+            <div id="recognition-details" class="d-none d-flex align-items-center">
+              <div class="flex-shrink-0">
+                <i class="fas fa-user-circle fa-6x text-primary"></i>
+              </div>
+              <div class="flex-grow-1 ms-3">
+                <h5 id="name">-</h5>
+                <div class="progress mb-2">
+                  <div class="progress-bar bg-success" role="progressbar" style="width: 0%" id="confidence-bar"></div>
+                </div>
+                <span class="badge bg-secondary" id="recognition-status-badge"></span>
+                <p class="mb-0 text-muted" id="confidence-text">Confianza: 0%</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Columna derecha: Registro de asistencia -->
+      <div class="col-md-6 mb-4">
+        <div class="card">
+          <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">
+              <i class="fas fa-clipboard-list me-2"></i> Registro de Asistencia
+            </h5>
+            <button class="btn btn-sm btn-light" id="refresh-btn">
+              <i class="fas fa-sync-alt"></i>
+            </button>
+          </div>
+
+          <div class="card-body p-0">
+            <div class="attendance-table">
+              <table class="table table-hover mb-0">
+                <thead>
+                  <tr>
+                    <th scope="col">Nombre</th>
+                    <th scope="col">Fecha y Hora</th>
+                  </tr>
+                </thead>
+                <tbody id="attendance-data">
+                  <tr>
+                    <td colspan="2" class="text-center py-4">
+                      <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Cargando...</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card-footer bg-light d-flex justify-content-between align-items-center">
+            <span id="attendance-count">0 asistencias registradas</span>
+            <small class="text-muted" id="last-updated">Última actualización: --</small>
+          </div>
+        </div>
+
+        <!-- Estadísticas -->
+        <div class="card mt-4">
+          <div class="card-header bg-warning text-white">
+            <h5 class="mb-0">
+              <i class="fas fa-chart-pie me-2"></i> Estadísticas
+            </h5>
+          </div>
+          <div class="card-body">
+            <div class="row g-3">
+              <div class="col-6">
+                <div class="border rounded p-3 text-center">
+                  <i class="fas fa-users fa-2x text-primary mb-2"></i>
+                  <h3 id="total-students">0</h3>
+                  <p class="mb-0 text-muted">Alumnos totales</p>
+                </div>
+              </div>
+              <div class="col-6">
+                <div class="border rounded p-3 text-center">
+                  <i class="fas fa-user-check fa-2x text-success mb-2"></i>
+                  <h3 id="today-attendance">0</h3>
+                  <p class="mb-0 text-muted">Asistencias hoy</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="./static/js/script.js"></script>
+</body>
+</html>
