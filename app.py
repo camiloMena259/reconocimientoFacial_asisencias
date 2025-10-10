@@ -11,7 +11,7 @@ from flask import Flask, render_template, Response, jsonify
 
 app = Flask(__name__)
 
-# Configuración de archivo de asistenciaa
+# Configuración de archivo de asistenciaaa
 ATTENDANCE_FILE = os.path.join(os.path.dirname(__file__), "attendance.csv")
 ATTENDANCE_COLUMNS = ["Nombre", "Fecha"]
 
