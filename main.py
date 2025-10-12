@@ -5,7 +5,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import face_recognition
-from flask import Flask, render_template, Response, jsonify
+from flask import Flask, render_template, Response, jsonify, request
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -28,6 +28,13 @@ last_recognition_time = 0
 recognition_cooldown = 2  # segundos entre reconocimientos del mismo alumno
 camera_lock = threading.Lock()
 
+# Variables para el modo de registro de usuarios
+current_mode = "asistencia"  # "asistencia" o "registro"
+captured_photos = []  # Lista para almacenar las 4 fotos capturadas
+capture_count = 0  # Contador de fotos capturadas
+registration_status = "idle"  # "idle", "capturing", "preview", "processing"
+reload_embeddings = False  # Señal para recargar embeddings en el hilo principal
+
 # 🧠 CARGAR ROSTROS DESDE POSTGRESQL (reemplaza load_face_encodings)
 def load_face_encodings():
     """Cargar embeddings desde PostgreSQL en lugar de archivos"""
@@ -35,12 +42,15 @@ def load_face_encodings():
     
     db = get_db_session()
     try:
-        # Consultar embeddings de estudiantes activos
+        # Consultar embeddings de estudiantes activos agrupados por usuario
         result = db.execute(text("""
-            SELECT u.nombre, u.apellido, e.embedding_vector 
+            SELECT u.id_usuario, u.nombre, u.apellido, 
+                   array_agg(e.embedding_vector ORDER BY e.quality_score DESC) as embeddings,
+                   COUNT(e.embedding_vector) as num_embeddings
             FROM usuarios u 
             JOIN embeddings_faciales e ON u.id_usuario = e.id_usuario 
-            WHERE u.rol = 'estudiante' AND u.estado = 'activo' AND e.activo = 'true'
+            WHERE u.rol = 'estudiante' AND u.estado = 'activo' AND e.activo = true
+            GROUP BY u.id_usuario, u.nombre, u.apellido
         """)).fetchall()
         
         known_face_encodings = []
@@ -48,21 +58,25 @@ def load_face_encodings():
         
         for row in result:
             try:
-                nombre = row[0]
-                apellido = row[1] 
-                embedding_bytes = row[2]
+                user_id = row[0]
+                nombre = row[1]
+                apellido = row[2] 
+                embeddings_list = row[3]  # Array de embeddings
+                num_embeddings = row[4]
                 
-                # Convertir bytes a numpy array
-                embedding = np.frombuffer(embedding_bytes, dtype=np.float64)
-                
-                known_face_encodings.append(embedding)
-                valid_names.append(f"{nombre} {apellido}")
-                print(f"  ✅ Cargado: {nombre} {apellido}")
+                if embeddings_list and len(embeddings_list) > 0:
+                    # Usar el primer embedding (mejor calidad por el ORDER BY)
+                    embedding_bytes = embeddings_list[0]
+                    embedding = np.frombuffer(embedding_bytes, dtype=np.float64)
+                    
+                    known_face_encodings.append(embedding)
+                    valid_names.append(f"{nombre} {apellido}")
+                    print(f"  ✅ Cargado: {nombre} {apellido} ({num_embeddings} fotos disponibles)")
                 
             except Exception as e:
                 print(f"  ❌ Error procesando {nombre}: {e}")
         
-        print(f"✅ Total de rostros cargados: {len(valid_names)}")
+        print(f"✅ Total de usuarios únicos cargados: {len(valid_names)}")
         return known_face_encodings, valid_names
         
     except Exception as e:
@@ -155,6 +169,100 @@ def mark_attendance(name):
         print(f"❌ Error al marcar asistencia: {str(e)}")
         return False
 
+def save_new_user(nombre, apellido, email, photos_data):
+    """Guardar nuevo usuario con sus fotos y embeddings en la base de datos"""
+    try:
+        db = get_db_session()
+        
+        # 1. Insertar usuario
+        # Generar email por defecto si no se proporciona
+        if not email:
+            email = f"{nombre.lower()}.{apellido.lower()}@estudiante.local"
+        
+        # Generar contraseña hash por defecto (se puede cambiar después)
+        default_password_hash = "default_hash_changeme"
+        
+        result = db.execute(text("""
+            INSERT INTO usuarios (nombre, apellido, correo, contrasena_hash, rol, estado)
+            VALUES (:nombre, :apellido, :correo, :contrasena_hash, 'estudiante', 'activo')
+            RETURNING id_usuario
+        """), {
+            "nombre": nombre,
+            "apellido": apellido, 
+            "correo": email,
+            "contrasena_hash": default_password_hash
+        })
+        
+        user_id = result.fetchone()[0]
+        
+        # 2. Procesar fotos y generar embeddings
+        embeddings_saved = 0
+        for i, photo_bytes in enumerate(photos_data):
+            try:
+                # Convertir bytes a numpy array (imagen)
+                nparr = np.frombuffer(photo_bytes, np.uint8)
+                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                
+                # Generar embedding
+                face_locations = face_recognition.face_locations(rgb_image)
+                print(f"  📸 Foto {i+1}: Encontradas {len(face_locations)} caras")
+                
+                if len(face_locations) > 0:
+                    face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+                    print(f"  🧠 Foto {i+1}: Generados {len(face_encodings)} embeddings")
+                    
+                    if len(face_encodings) > 0:
+                        embedding = face_encodings[0]
+                        embedding_bytes = embedding.tobytes()
+                        
+                        # Guardar embedding en BD
+                        db.execute(text("""
+                            INSERT INTO embeddings_faciales (id_usuario, embedding_vector, quality_score, detection_confidence, activo)
+                            VALUES (:id_usuario, :embedding_vector, :quality_score, :detection_confidence, true)
+                        """), {
+                            "id_usuario": user_id,
+                            "embedding_vector": embedding_bytes,
+                            "quality_score": 0.85,  # Valor por defecto
+                            "detection_confidence": 0.90  # Valor por defecto
+                        })
+                        
+                        embeddings_saved += 1
+                        print(f"✅ Embedding {i+1} guardado para {nombre} {apellido}")
+                    else:
+                        print(f"⚠️ Foto {i+1}: No se pudieron generar embeddings")
+                else:
+                    print(f"⚠️ Foto {i+1}: No se encontraron caras en la imagen")
+                
+            except Exception as e:
+                print(f"❌ Error procesando foto {i+1}: {e}")
+                # En caso de error, hacer rollback de la transacción
+                if 'db' in locals():
+                    db.rollback()
+        
+        if embeddings_saved > 0:
+            db.commit()
+            print(f"✅ Usuario {nombre} {apellido} registrado con {embeddings_saved} embeddings")
+            
+            # Señalar al hilo principal que recargue embeddings
+            global reload_embeddings
+            reload_embeddings = True
+            print("📡 Señal de recarga enviada al hilo de reconocimiento")
+            
+            db.close()
+            return True, f"Usuario registrado exitosamente con {embeddings_saved} fotos"
+        else:
+            db.rollback()
+            db.close()
+            return False, "No se pudo generar ningún embedding válido. Asegúrate de que las fotos muestren claramente el rostro."
+            
+    except Exception as e:
+        print(f"❌ Error guardando usuario: {e}")
+        if 'db' in locals():
+            db.rollback()
+            db.close()
+        return False, f"Error: {str(e)}"
+
 def release_camera():
     """Libera los recursos de la cámara si está activa."""
     global camera_active
@@ -166,7 +274,7 @@ def release_camera():
 
 def facial_recognition_thread():
     """Función que se ejecuta en un hilo separado para el reconocimiento facial."""
-    global global_frame, recognized_person, camera_active
+    global global_frame, recognized_person, camera_active, current_mode, captured_photos, capture_count, registration_status, reload_embeddings
 
     print("🎥 Iniciando hilo de reconocimiento facial...")
     
@@ -212,6 +320,13 @@ def facial_recognition_thread():
 
     try:
         while camera_active:
+            # Verificar si necesitamos recargar embeddings
+            if reload_embeddings:
+                print("🔄 Recargando embeddings por nuevo registro...")
+                known_face_encodings, valid_names = load_face_encodings()
+                reload_embeddings = False
+                print(f"✅ Embeddings recargados: {len(valid_names)} usuarios disponibles")
+
             ret, frame = cap.read()
             if not ret:
                 print("❌ Error al leer frame de la cámara")
@@ -220,9 +335,27 @@ def facial_recognition_thread():
             # Crear una copia para mostrar
             display_frame = frame.copy()
 
-            # Procesar cada X frames
+            # Mostrar información del modo actual
+            if current_mode == "registro":
+                cv2.putText(display_frame, f"MODO REGISTRO - Fotos: {capture_count}/4", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # En modo registro, solo mostrar el frame sin procesar
+                if registration_status == "capturing":
+                    # Mostrar indicador de captura
+                    cv2.putText(display_frame, "Presiona CAPTURAR cuando estes listo", 
+                               (10, display_frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                elif registration_status == "preview":
+                    cv2.putText(display_frame, "Revisa las fotos y confirma registro", 
+                               (10, display_frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            else:
+                # Modo asistencia normal - procesar reconocimiento
+                cv2.putText(display_frame, "MODO ASISTENCIA", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Procesar cada X frames (solo en modo asistencia)
             frame_count += 1
-            if frame_count % FRAME_SKIP == 0:
+            if frame_count % FRAME_SKIP == 0 and current_mode == "asistencia":
                 # Redimensionar para mejor rendimiento
                 small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
                 rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
@@ -249,8 +382,6 @@ def facial_recognition_thread():
                         best_distance = face_distances[best_match_index]
                         confidence = 1 - best_distance
                         
-
-
                         if matches and matches[best_match_index]:
                             name = valid_names[best_match_index]
                             
@@ -388,6 +519,150 @@ def recognition_status():
         'camera_active': camera_active,
         'faces_loaded': len(valid_names)
     })
+
+@app.route('/toggle_mode', methods=['POST'])
+def toggle_mode():
+    """Cambiar entre modo asistencia y registro"""
+    global current_mode, captured_photos, capture_count, registration_status
+    
+    data = request.get_json()
+    new_mode = data.get('mode', 'asistencia')
+    
+    if new_mode in ['asistencia', 'registro']:
+        current_mode = new_mode
+        
+        # Limpiar estado si cambia a modo registro
+        if new_mode == "registro":
+            captured_photos = []
+            capture_count = 0
+            registration_status = "capturing"
+        else:
+            registration_status = "idle"
+        
+        return jsonify({
+            'success': True, 
+            'current_mode': current_mode,
+            'message': f'Cambiado a modo {new_mode}'
+        })
+    else:
+        return jsonify({'success': False, 'message': 'Modo inválido'})
+
+@app.route('/capture_photo', methods=['POST'])
+def capture_photo():
+    """Capturar una foto del frame actual para registro"""
+    global global_frame, captured_photos, capture_count, registration_status
+    
+    if current_mode != "registro":
+        return jsonify({'success': False, 'message': 'No estás en modo registro'})
+    
+    if capture_count >= 4:
+        return jsonify({'success': False, 'message': 'Ya capturaste 4 fotos'})
+    
+    if global_frame is None:
+        return jsonify({'success': False, 'message': 'No hay frame disponible'})
+    
+    try:
+        # Guardar el frame actual
+        captured_photos.append(global_frame)
+        capture_count += 1
+        
+        # Si ya tenemos 4 fotos, cambiar a modo preview
+        if capture_count >= 4:
+            registration_status = "preview"
+        
+        return jsonify({
+            'success': True, 
+            'capture_count': capture_count,
+            'total_needed': 4,
+            'status': registration_status,
+            'message': f'Foto {capture_count}/4 capturada'
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+@app.route('/get_captured_photos')
+def get_captured_photos():
+    """Obtener las fotos capturadas para preview"""
+    global captured_photos, capture_count
+    
+    try:
+        # Convertir cada foto a base64 para enviar al frontend
+        import base64
+        photos_b64 = []
+        
+        for photo_bytes in captured_photos:
+            b64_string = base64.b64encode(photo_bytes).decode('utf-8')
+            photos_b64.append(f"data:image/jpeg;base64,{b64_string}")
+        
+        return jsonify({
+            'success': True,
+            'photos': photos_b64,
+            'count': capture_count
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+@app.route('/save_user', methods=['POST'])
+def save_user():
+    """Guardar nuevo usuario con sus fotos"""
+    global captured_photos, current_mode, capture_count, registration_status
+    
+    if current_mode != "registro":
+        return jsonify({'success': False, 'message': 'No estás en modo registro'})
+    
+    if len(captured_photos) != 4:
+        return jsonify({'success': False, 'message': 'Necesitas exactamente 4 fotos'})
+    
+    try:
+        data = request.get_json()
+        nombre = data.get('nombre', '').strip()
+        apellido = data.get('apellido', '').strip()
+        email = data.get('email', '').strip()
+        
+        # Validaciones básicas
+        if not nombre or not apellido:
+            return jsonify({'success': False, 'message': 'Nombre y apellido son requeridos'})
+        
+        if email and '@' not in email:
+            return jsonify({'success': False, 'message': 'Email inválido'})
+        
+        registration_status = "processing"
+        
+        # Guardar usuario
+        success, message = save_new_user(nombre, apellido, email, captured_photos)
+        
+        if success:
+            # Limpiar estado y volver a modo asistencia
+            captured_photos = []
+            capture_count = 0
+            current_mode = "asistencia"
+            registration_status = "idle"
+            
+            return jsonify({
+                'success': True, 
+                'message': message,
+                'redirect': True
+            })
+        else:
+            registration_status = "preview"  # Volver a preview para reintentar
+            return jsonify({'success': False, 'message': message})
+    
+    except Exception as e:
+        registration_status = "preview"
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+@app.route('/reset_registration', methods=['POST'])
+def reset_registration():
+    """Reiniciar el proceso de registro"""
+    global captured_photos, capture_count, registration_status
+    
+    captured_photos = []
+    capture_count = 0 
+    registration_status = "capturing"
+    
+    return jsonify({'success': True, 'message': 'Registro reiniciado'})
 
 if __name__ == '__main__':
     print("🚀 === TU SISTEMA DE RECONOCIMIENTO FACIAL + POSTGRESQL ===")
