@@ -9,7 +9,12 @@ dependencies:
   - pandas
   - opencv
   - dlib
+  - postgresql
+  - psycopg2  # Instalado via conda en lugar de pip
+  - sqlalchemy
+  - alembic
   - pip:
     - face_recognition
     - flask
     - opencv-python
+    - python-dotenv

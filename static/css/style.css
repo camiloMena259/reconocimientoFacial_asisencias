@@ -48,6 +48,27 @@
     box-shadow: 0 0 15px rgba(40, 167, 69, 0.5);
 }
 
+.db-status {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(40, 167, 69, 0.9);
+    color: white;
+    padding: 5px 10px;
+    border-radius: 15px;
+    font-size: 12px;
+    font-weight: 500;
+    z-index: 5;
+}
+
+.db-status.error {
+    background: rgba(220, 53, 69, 0.9);
+}
+
+.db-status i {
+    margin-right: 5px;
+}
+
 .attendance-table {
     max-height: 400px;
     overflow-y: auto;
