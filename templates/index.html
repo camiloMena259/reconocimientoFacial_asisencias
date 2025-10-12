@@ -29,13 +29,10 @@
     <div class="row">
       <div class="col-md-6 mb-4">
         <div class="card">
-          <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+          <div class="card-header bg-primary text-white">
             <h5 class="mb-0">
               <i class="fas fa-camera me-2"></i> Cámara en vivo
             </h5>
-            <button class="btn btn-sm btn-light" id="restart-camera-btn">
-              <i class="fas fa-sync-alt"></i>
-            </button>
           </div>
 
           <div class="card-body p-0">
@@ -49,16 +46,7 @@
               </div>
             </div>
 
-            <div class="camera-error d-none" id="camera-error">
-              <i class="fas fa-video-slash fa-3x mb-2"></i>
-              <h5>No se puede acceder a la cámara</h5>
-              <p class="text-center">
-                Verifica que la cámara esté conectada y que hayas dado permisos al navegador.
-              </p>
-              <button class="btn btn-primary" onclick="restartCamera()">
-                <i class="fas fa-sync-alt me-2"></i> Reintentar
-              </button>
-            </div>
+
           </div>
         </div>
 

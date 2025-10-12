@@ -1,11 +1,9 @@
-import os
 import time
 import threading
 from datetime import datetime
 
 import cv2
 import numpy as np
-import pandas as pd
 import face_recognition
 from flask import Flask, render_template, Response, jsonify
 from sqlalchemy import create_engine, text
@@ -99,28 +97,15 @@ def mark_attendance(name):
         
         id_estudiante = result[0]
         
-        # Verificar si ya registró hoy
-        today = datetime.now().date()
-        existing = db.execute(text("""
-            SELECT id_asistencia FROM asistencias 
-            WHERE id_estudiante = :id_estudiante 
-            AND DATE(fecha_registro) = :today
-        """), {"id_estudiante": id_estudiante, "today": today}).fetchone()
-        
-        if existing:
-            print(f"⚠ {name} ya registró asistencia hoy")
-            last_recognition_time = current_time
-            return True  # Ya registrado
-        
-        # Obtener o crear sesión activa
-        result = db.execute(text("""
+        # Obtener sesión activa primero
+        session_result = db.execute(text("""
             SELECT id_sesion FROM sesiones 
             WHERE activa = true 
             ORDER BY fecha_programada DESC 
             LIMIT 1
         """)).fetchone()
         
-        if not result:
+        if not session_result:
             # Crear sesión automática
             db.execute(text("""
                 INSERT INTO sesiones (id_curso, nombre, descripcion, fecha_programada, tipo, activa)
@@ -128,13 +113,26 @@ def mark_attendance(name):
             """), {"fecha": datetime.now()})
             db.commit()
             
-            result = db.execute(text("""
+            session_result = db.execute(text("""
                 SELECT id_sesion FROM sesiones ORDER BY id_sesion DESC LIMIT 1
             """)).fetchone()
         
-        id_sesion = result[0]
+        id_sesion = session_result[0]
         
-        # Registrar asistencia
+        # Verificar si ya registró en esta sesión específica
+        existing = db.execute(text("""
+            SELECT id_asistencia FROM asistencias 
+            WHERE id_estudiante = :id_estudiante 
+            AND id_sesion = :id_sesion
+        """), {"id_estudiante": id_estudiante, "id_sesion": id_sesion}).fetchone()
+        
+        if existing:
+            print(f"⚠️ {name} ya registró asistencia en esta sesión")
+            last_recognition_time = current_time
+            db.close()
+            return True  # Ya registrado
+        
+        # Registrar asistencia (ya tenemos id_sesion del bloque anterior)
         db.execute(text("""
             INSERT INTO asistencias (id_estudiante, id_sesion, fecha_registro, metodo_registro, estado)
             VALUES (:id_estudiante, :id_sesion, :fecha_registro, :metodo_registro, :estado)
@@ -171,6 +169,12 @@ def facial_recognition_thread():
     global global_frame, recognized_person, camera_active
 
     print("🎥 Iniciando hilo de reconocimiento facial...")
+    
+    # Cargar rostros conocidos
+    known_face_encodings, valid_names = load_face_encodings()
+    if len(known_face_encodings) == 0:
+        print("❌ No hay rostros cargados para reconocer")
+        return
 
     # Asegurar que la cámara está libre antes de intentar acceder
     release_camera()
@@ -200,9 +204,10 @@ def facial_recognition_thread():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # Parámetros de reconocimiento (TUS MISMOS VALORES)
-    TOLERANCE = 0.45  # Valor más bajo = más estricto
-    FRAME_SKIP = 3  # Procesar cada X frames para mejor rendimiento
+    # Parámetros de reconocimiento balanceados
+    TOLERANCE = 0.45  # Tolerance original que funcionaba
+    FRAME_SKIP = 4  # Procesar cada 4 frames
+    CONFIDENCE_THRESHOLD = 0.55  # Confianza mínima más flexible
     frame_count = 0
 
     try:
@@ -225,6 +230,8 @@ def facial_recognition_thread():
                 # Encontrar rostros en el frame
                 face_locations = face_recognition.face_locations(rgb_small_frame)
                 face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+                
+
 
                 for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
                     # Escalar de vuelta las coordenadas
@@ -240,19 +247,30 @@ def facial_recognition_thread():
                     if len(face_distances) > 0:
                         best_match_index = np.argmin(face_distances)
                         best_distance = face_distances[best_match_index]
+                        confidence = 1 - best_distance
+                        
+
 
                         if matches and matches[best_match_index]:
                             name = valid_names[best_match_index]
-                            # Dibujar rectángulo verde para reconocido
-                            cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                            confidence = 1 - best_distance
-                            cv2.putText(display_frame, f"{name} ({confidence:.2f})", 
-                                       (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            
+                            # Solo procesar si la confianza es alta
+                            if confidence >= CONFIDENCE_THRESHOLD:
+                                # Dibujar rectángulo verde para reconocido con alta confianza
+                                cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                                cv2.putText(display_frame, f"{name} ({confidence:.2f})", 
+                                           (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                            already_registered = mark_attendance(name)
-                            status_text = "Ya registrado" if already_registered else "Registrado"
-                            recognized_person = {
-                                'name': name, 'confidence': confidence, 'status': status_text}
+                                already_registered = mark_attendance(name)
+                                status_text = "Ya registrado" if already_registered else "Registrado"
+                                recognized_person = {
+                                    'name': name, 'confidence': confidence, 'status': status_text}
+                            else:
+                                # Confianza baja - mostrar como "posible" pero no registrar
+                                cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 165, 255), 2)  # Naranja
+                                cv2.putText(display_frame, f"¿{name}? ({confidence:.2f})", 
+                                           (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                                recognized_person = None
                         else:
                             # Dibujar rectángulo rojo para no reconocido
                             cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 0, 255), 2)
@@ -370,22 +388,6 @@ def recognition_status():
         'camera_active': camera_active,
         'faces_loaded': len(valid_names)
     })
-
-@app.route('/reload_faces')
-def reload_faces():
-    """Recargar rostros desde PostgreSQL"""
-    global known_face_encodings, valid_names
-    try:
-        known_face_encodings, valid_names = load_face_encodings()
-        return jsonify({
-            'status': 'success',
-            'message': f'Rostros recargados desde PostgreSQL. Total: {len(valid_names)}'
-        })
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Error recargando rostros: {str(e)}'
-        })
 
 if __name__ == '__main__':
     print("🚀 === TU SISTEMA DE RECONOCIMIENTO FACIAL + POSTGRESQL ===")
