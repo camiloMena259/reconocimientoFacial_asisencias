@@ -1,0 +1,29 @@
+# 📦 DEPENDENCIAS PARA SERVIDOR DE PRODUCCIÓN
+
+# Framework web
+Flask==2.3.3
+gunicorn==21.2.0
+
+# Base de datos
+psycopg2-binary==2.9.7
+SQLAlchemy==2.0.21
+
+# Computer Vision y AI
+opencv-python-headless==4.8.1.78
+face-recognition==1.3.0
+dlib==19.24.2
+numpy==1.24.3
+
+# Utilidades
+python-dotenv==1.0.0
+Pillow==10.0.1
+
+# Monitoreo y logs
+prometheus-flask-exporter==0.23.0
+
+# Validación y seguridad
+Werkzeug==2.3.7
+MarkupSafe==2.1.3
+
+# Desarrollo (remover en producción)
+# flask-cors==4.0.0

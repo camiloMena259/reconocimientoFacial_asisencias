@@ -1,6 +1,8 @@
 import time
 import threading
 from datetime import datetime
+import sys
+import os
 
 import cv2
 import numpy as np
@@ -9,7 +11,14 @@ from flask import Flask, render_template, Response, jsonify, request
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+# Agregar path y importar gestor académico
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from src.utils.gestor_academico_automatico import GestorAcademicoAutomatico
+
 app = Flask(__name__)
+
+# INSTANCIA GLOBAL DEL GESTOR ACADÉMICO
+gestor_academico = GestorAcademicoAutomatico()
 
 # 🔗 CONFIGURACIÓN POSTGRESQL (reemplaza el CSV)
 DATABASE_URL = 'postgresql://postgres:camilomena@localhost:5432/prototipoPG_v2'
@@ -87,15 +96,27 @@ def load_face_encodings():
 
 known_face_encodings, valid_names = load_face_encodings()
 
-# 📝 REGISTRAR ASISTENCIA EN POSTGRESQL (reemplaza mark_attendance)
+# 📝 REGISTRAR ASISTENCIA COMPLETAMENTE AUTOMÁTICA
 def mark_attendance(name):
-    """Registra la asistencia en PostgreSQL en lugar de CSV"""
+    """
+    Sistema completamente automático:
+    1. Detecta período académico actual
+    2. Busca o crea sesión automáticamente  
+    3. Habilita asistencia automáticamente
+    4. Registra asistencia en el corte correcto
+    """
     global last_recognition_time
 
     try:
         current_time = time.time()
         if current_time - last_recognition_time < recognition_cooldown:
             return False
+
+        # Obtener información académica actual AUTOMÁTICAMENTE
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        print(f"🎯 SISTEMA AUTOMÁTICO - Registrando en: {info_academica['descripcion_periodo']}")
+        print(f"📅 Fecha: {info_academica['fecha_consultada']}")
+        print(f"🗓️ Mes: {info_academica['nombre_mes']}")
 
         db = get_db_session()
         
@@ -107,66 +128,188 @@ def mark_attendance(name):
         
         if not result:
             print(f"❌ Estudiante no encontrado: {name}")
+            db.close()
             return False
         
         id_estudiante = result[0]
+        print(f"👤 Estudiante encontrado: {name} (ID: {id_estudiante})")
         
-        # Obtener sesión activa primero
-        session_result = db.execute(text("""
-            SELECT id_sesion FROM sesiones 
-            WHERE activa = true 
-            ORDER BY fecha_programada DESC 
-            LIMIT 1
-        """)).fetchone()
+        # PASO 1: Buscar sesión del día actual en el corte correcto
+        sesion_activa = gestor_academico.obtener_sesion_activa_actual()
         
-        if not session_result:
-            # Crear sesión automática
-            db.execute(text("""
-                INSERT INTO sesiones (id_curso, nombre, descripcion, fecha_programada, tipo, activa)
-                VALUES (1, 'Sesión Automática', 'Reconocimiento facial', :fecha, 'clase', true)
-            """), {"fecha": datetime.now()})
+        if not sesion_activa:
+            print("🔄 No hay sesión activa, creando sesión automática para el período actual...")
+            
+            # Crear sesión automática en el período correcto
+            from datetime import datetime
+            now = datetime.now()
+            dias = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+            dia_actual = dias[now.weekday()]
+            
+            # Crear sesión en sesiones_academicas (nueva tabla)
+            crear_sesion_query = """
+            INSERT INTO sesiones_academicas (
+                año, semestre, corte, id_curso, numero_sesion, nombre_sesion,
+                descripcion, fecha_programada, hora_inicio, hora_fin, dia_semana,
+                aula, estado, asistencia_habilitada, tolerancia_minutos,
+                duracion_horas, tipo_clase, creada_en
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (año, semestre, corte, id_curso, numero_sesion) 
+            DO UPDATE SET 
+                asistencia_habilitada = EXCLUDED.asistencia_habilitada,
+                estado = EXCLUDED.estado,
+                actualizada_en = CURRENT_TIMESTAMP
+            RETURNING id_sesion;
+            """
+            
+            # Calcular hora de fin (1 hora después)
+            hora_fin = now.replace(hour=min(23, now.hour + 1))
+            
+            # Buscar último número de sesión para generar uno nuevo
+            cursor = db.execute(text("""
+                SELECT COALESCE(MAX(numero_sesion), 0) + 1 
+                FROM sesiones_academicas 
+                WHERE año = :año AND semestre = :semestre AND corte = :corte
+            """), {
+                "año": info_academica['año'],
+                "semestre": info_academica['semestre'], 
+                "corte": info_academica['corte']
+            }).fetchone()
+            
+            numero_sesion = cursor[0] if cursor else 1
+            
+            # Ejecutar creación de sesión
+            result_sesion = db.execute(text(crear_sesion_query), (
+                info_academica['año'],           # año
+                info_academica['semestre'],      # semestre
+                info_academica['corte'],         # corte
+                1,                              # id_curso (por defecto)
+                numero_sesion,                  # numero_sesion
+                f'Sesión Automática - {now.strftime("%d/%m/%Y")}',  # nombre_sesion
+                f'Sesión creada automáticamente por reconocimiento facial',  # descripcion
+                now.date(),                     # fecha_programada
+                now.time(),                     # hora_inicio
+                hora_fin.time(),               # hora_fin
+                dia_actual,                    # dia_semana
+                'Aula Reconocimiento Facial',  # aula
+                'activa',                      # estado
+                True,                          # asistencia_habilitada ¡AUTOMÁTICO!
+                15,                            # tolerancia_minutos
+                1.0,                           # duracion_horas
+                'reconocimiento',              # tipo_clase
+                now                            # creada_en
+            ))
+            
+            id_sesion_nueva = result_sesion.fetchone()[0]
             db.commit()
             
-            session_result = db.execute(text("""
-                SELECT id_sesion FROM sesiones ORDER BY id_sesion DESC LIMIT 1
-            """)).fetchone()
+            print(f"✅ Sesión automática creada: ID {id_sesion_nueva}")
+            print(f"📚 Período: {info_academica['descripcion_periodo']}")
+            print(f"🕐 Horario: {now.strftime('%H:%M')} - {hora_fin.strftime('%H:%M')}")
+            
+            id_sesion_para_asistencia = id_sesion_nueva
+        else:
+            print(f"✅ Sesión encontrada: {sesion_activa['nombre_sesion']}")
+            id_sesion_para_asistencia = sesion_activa['id_sesion']
+            
+            # Si la sesión existe pero no está habilitada, habilitarla AUTOMÁTICAMENTE
+            if not sesion_activa['asistencia_habilitada']:
+                print("🔄 Habilitando asistencia automáticamente...")
+                db.execute(text("""
+                    UPDATE sesiones_academicas 
+                    SET asistencia_habilitada = true,
+                        estado = 'activa',
+                        actualizada_en = CURRENT_TIMESTAMP
+                    WHERE id_sesion = :id_sesion
+                """), {"id_sesion": sesion_activa['id_sesion']})
+                db.commit()
+                print("✅ Asistencia habilitada automáticamente")
         
-        id_sesion = session_result[0]
+        # PASO 2: Verificar si ya registró asistencia
+        verificar_asistencia = db.execute(text("""
+            SELECT id_asistencia, estado, minutos_tardanza 
+            FROM asistencias_academicas 
+            WHERE id_sesion = :id_sesion AND id_estudiante = :id_estudiante
+        """), {
+            "id_sesion": id_sesion_para_asistencia,
+            "id_estudiante": id_estudiante
+        }).fetchone()
         
-        # Verificar si ya registró en esta sesión específica
-        existing = db.execute(text("""
-            SELECT id_asistencia FROM asistencias 
-            WHERE id_estudiante = :id_estudiante 
-            AND id_sesion = :id_sesion
-        """), {"id_estudiante": id_estudiante, "id_sesion": id_sesion}).fetchone()
-        
-        if existing:
-            print(f"⚠️ {name} ya registró asistencia en esta sesión")
+        if verificar_asistencia:
+            print(f"⚠️ {name} ya registró asistencia como: {verificar_asistencia[1]}")
             last_recognition_time = current_time
             db.close()
             return True  # Ya registrado
         
-        # Registrar asistencia (ya tenemos id_sesion del bloque anterior)
+        # PASO 3: Calcular estado (presente/tardanza) automáticamente
+        from datetime import datetime
+        ahora = datetime.now()
+        
+        # Obtener hora de inicio de la sesión
+        sesion_info = db.execute(text("""
+            SELECT hora_inicio, tolerancia_minutos 
+            FROM sesiones_academicas 
+            WHERE id_sesion = :id_sesion
+        """), {"id_sesion": id_sesion_para_asistencia}).fetchone()
+        
+        if sesion_info:
+            hora_inicio_sesion = datetime.combine(ahora.date(), sesion_info[0])
+            tolerancia = sesion_info[1] or 15
+        else:
+            # Si no hay info, usar la hora actual como referencia
+            hora_inicio_sesion = ahora
+            tolerancia = 15
+        
+        diferencia_minutos = (ahora - hora_inicio_sesion).total_seconds() / 60
+        
+        if diferencia_minutos <= tolerancia:
+            estado_asistencia = 'presente'
+            minutos_tardanza = 0
+            print(f"✅ Estado: PRESENTE (llegó {diferencia_minutos:.0f} min después del inicio)")
+        else:
+            estado_asistencia = 'tardanza'
+            minutos_tardanza = int(diferencia_minutos - tolerancia)
+            print(f"⏰ Estado: TARDANZA ({minutos_tardanza} min de retraso)")
+        
+        # PASO 4: Registrar asistencia AUTOMÁTICAMENTE
         db.execute(text("""
-            INSERT INTO asistencias (id_estudiante, id_sesion, fecha_registro, metodo_registro, estado)
-            VALUES (:id_estudiante, :id_sesion, :fecha_registro, :metodo_registro, :estado)
+            INSERT INTO asistencias_academicas (
+                id_sesion, id_estudiante, fecha_registro, metodo_registro,
+                confidence_score, estado, minutos_tardanza
+            ) VALUES (:id_sesion, :id_estudiante, :fecha_registro, :metodo_registro, 
+                     :confidence_score, :estado, :minutos_tardanza)
         """), {
+            "id_sesion": id_sesion_para_asistencia,
             "id_estudiante": id_estudiante,
-            "id_sesion": id_sesion, 
-            "fecha_registro": datetime.now(),
+            "fecha_registro": ahora,
             "metodo_registro": "reconocimiento_facial",
-            "estado": "presente"
+            "confidence_score": None,
+            "estado": estado_asistencia,
+            "minutos_tardanza": minutos_tardanza
         })
         
         db.commit()
         db.close()
         
         last_recognition_time = current_time
-        print(f"✅ Asistencia registrada: {name} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return False  # Nuevo registro
+        
+        # MENSAJE DE ÉXITO COMPLETO
+        print("="*60)
+        print(f"🎉 ¡ASISTENCIA REGISTRADA AUTOMÁTICAMENTE!")
+        print(f"👤 Estudiante: {name}")
+        print(f"📚 Período: {info_academica['descripcion_periodo']}")
+        print(f"📅 Fecha: {ahora.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"✅ Estado: {estado_asistencia.upper()}")
+        if minutos_tardanza > 0:
+            print(f"⏰ Tardanza: {minutos_tardanza} minutos")
+        print("="*60)
+        
+        return True
         
     except Exception as e:
-        print(f"❌ Error al marcar asistencia: {str(e)}")
+        print(f"❌ Error en sistema automático: {str(e)}")
+        if 'db' in locals():
+            db.close()
         return False
 
 def save_new_user(nombre, apellido, email, photos_data):
@@ -481,26 +624,49 @@ def video_feed():
 
 @app.route('/get_attendance')
 def get_attendance():
-    """Obtener asistencias desde PostgreSQL (reemplaza CSV)"""
+    """Obtener asistencias desde la nueva tabla asistencias_academicas"""
     try:
         db = get_db_session()
         
-        # Obtener asistencias de hoy
+        # Obtener información académica actual para mostrar contexto
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        
+        # Obtener asistencias de hoy de la nueva tabla
         today = datetime.now().date()
         result = db.execute(text("""
-            SELECT u.nombre, u.apellido, a.fecha_registro, a.estado
-            FROM asistencias a
-            JOIN usuarios u ON a.id_estudiante = u.id_usuario
-            WHERE DATE(a.fecha_registro) = :today
-            ORDER BY a.fecha_registro DESC
+            SELECT 
+                u.nombre, 
+                u.apellido, 
+                aa.fecha_registro, 
+                aa.estado, 
+                aa.minutos_tardanza,
+                sa.nombre_sesion,
+                sa.corte,
+                sa.semestre
+            FROM asistencias_academicas aa
+            JOIN usuarios u ON aa.id_estudiante = u.id_usuario
+            JOIN sesiones_academicas sa ON aa.id_sesion = sa.id_sesion
+            WHERE DATE(aa.fecha_registro) = :today
+            ORDER BY aa.fecha_registro DESC
         """), {"today": today}).fetchall()
         
         records = []
         for row in result:
+            # Formatear estado con emoji
+            estado_display = row[3]
+            if row[3] == 'presente':
+                estado_display = '✅ Presente'
+            elif row[3] == 'tardanza':
+                estado_display = f'⏰ Tardanza ({row[4]} min)'
+            elif row[3] == 'ausente':
+                estado_display = '❌ Ausente'
+            
             records.append({
                 'Nombre': f"{row[0]} {row[1]}",
                 'Fecha': row[2].strftime('%Y-%m-%d %H:%M:%S') if row[2] else '',
-                'Estado': row[3]
+                'Estado': estado_display,
+                'Sesion': row[5] or 'Sin sesión',
+                'Periodo': f"{row[7]} - Corte {row[6]}"
             })
         
         db.close()
@@ -512,13 +678,52 @@ def get_attendance():
 
 @app.route('/recognition_status')
 def recognition_status():
-    """Estado del reconocimiento"""
+    """Estado del reconocimiento con estadísticas actualizadas"""
     global recognized_person, camera_active
-    return jsonify({
-        'person': recognized_person,
-        'camera_active': camera_active,
-        'faces_loaded': len(valid_names)
-    })
+    
+    # Obtener estadísticas de hoy
+    try:
+        db = get_db_session()
+        today = datetime.now().date()
+        
+        # Contar asistencias de hoy
+        asistencias_hoy = db.execute(text("""
+            SELECT COUNT(*) FROM asistencias_academicas aa
+            JOIN sesiones_academicas sa ON aa.id_sesion = sa.id_sesion
+            WHERE DATE(aa.fecha_registro) = :today
+        """), {"today": today}).fetchone()[0]
+        
+        # Contar total de estudiantes
+        total_estudiantes = db.execute(text("""
+            SELECT COUNT(*) FROM usuarios WHERE rol = 'estudiante'
+        """)).fetchone()[0]
+        
+        # Obtener información académica actual
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        
+        db.close()
+        
+        return jsonify({
+            'person': recognized_person,
+            'camera_active': camera_active,
+            'faces_loaded': len(valid_names),
+            'asistencias_hoy': asistencias_hoy,
+            'total_estudiantes': total_estudiantes,
+            'periodo_academico': info_academica['descripcion_periodo'],
+            'fecha_actual': info_academica['fecha_consultada']
+        })
+        
+    except Exception as e:
+        print(f"❌ Error obteniendo estadísticas: {e}")
+        return jsonify({
+            'person': recognized_person,
+            'camera_active': camera_active,
+            'faces_loaded': len(valid_names),
+            'asistencias_hoy': 0,
+            'total_estudiantes': 0,
+            'periodo_academico': 'Error',
+            'fecha_actual': 'Error'
+        })
 
 @app.route('/toggle_mode', methods=['POST'])
 def toggle_mode():
@@ -652,6 +857,68 @@ def save_user():
     except Exception as e:
         registration_status = "preview"
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+# 🎯 NUEVAS RUTAS DEL SISTEMA ACADÉMICO AUTOMÁTICO
+
+@app.route('/get_session_info')
+def get_session_info():
+    """
+    Obtiene información de la sesión actual para mostrar en la interfaz
+    """
+    try:
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        sesion_activa = gestor_academico.obtener_sesion_activa_actual()
+        
+        return jsonify({
+            'success': True,
+            'periodo_academico': info_academica['descripcion_periodo'],
+            'fecha_actual': info_academica['fecha_consultada'],
+            'mes_actual': info_academica['nombre_mes'],
+            'sesion_activa': sesion_activa is not None,
+            'info_sesion': sesion_activa if sesion_activa else None
+        })
+    except Exception as e:
+        print(f"❌ Error obteniendo info de sesión: {e}")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/toggle_asistencia', methods=['GET', 'POST'])
+def toggle_asistencia():
+    """
+    Habilita o deshabilita la asistencia para la sesión actual
+    """
+    try:
+        resultado = gestor_academico.habilitar_asistencia_automatica()
+        
+        return jsonify({
+            'success': resultado['exito'],
+            'message': resultado['mensaje'],
+            'session_info': resultado.get('sesion', {})
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        })
+
+@app.route('/estadisticas_corte')
+def estadisticas_corte():
+    """
+    Obtiene estadísticas del corte académico actual
+    """
+    try:
+        stats = gestor_academico.obtener_estadisticas_corte_actual()
+        
+        return jsonify({
+            'success': True,
+            'estadisticas': stats
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        })
 
 @app.route('/reset_registration', methods=['POST'])
 def reset_registration():

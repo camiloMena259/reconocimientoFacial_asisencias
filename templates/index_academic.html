@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sistema de Asistencia Académica - Reconocimiento Facial</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body>
+  <!-- Navbar con información académica -->
+  <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="#">
+        <i class="fas fa-graduation-cap me-2"></i>
+        Sistema de Asistencia Académica
+      </a>
+      
+      <!-- Información académica actual -->
+      <div class="navbar-nav me-auto">
+        <span class="navbar-text me-3" id="academic-context">
+          <i class="fas fa-calendar-alt me-1"></i>
+          <span id="current-period">Cargando...</span>
+        </span>
+      </div>
+
+      <div class="navbar-nav">
+        <span class="navbar-text">
+          <i class="fas fa-clock me-1"></i>
+          <span id="current-time"></span>
+        </span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container-fluid mt-4">
+    <!-- Panel de control de sesiones -->
+    <div class="row mb-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header bg-primary text-white">
+            <h5 class="mb-0">
+              <i class="fas fa-chalkboard-teacher me-2"></i>
+              Control de Sesiones Académicas
+            </h5>
+          </div>
+          <div class="card-body">
+            <div class="row">
+              <!-- Sesión activa -->
+              <div class="col-md-6">
+                <div id="active-session-info">
+                  <h6 class="text-muted mb-3">Sesión Activa</h6>
+                  <div id="no-active-session" class="alert alert-warning">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    No hay sesión activa. Selecciona una sesión para habilitar asistencia.
+                  </div>
+                  <div id="active-session-details" class="d-none">
+                    <div class="bg-light p-3 rounded">
+                      <h6 id="active-session-name" class="mb-2">-</h6>
+                      <div class="row">
+                        <div class="col-sm-6">
+                          <small class="text-muted">Curso:</small>
+                          <div id="active-course-name">-</div>
+                        </div>
+                        <div class="col-sm-6">
+                          <small class="text-muted">Aula:</small>
+                          <div id="active-aula">-</div>
+                        </div>
+                        <div class="col-sm-6">
+                          <small class="text-muted">Horario:</small>
+                          <div id="active-schedule">-</div>
+                        </div>
+                        <div class="col-sm-6">
+                          <small class="text-muted">Corte:</small>
+                          <div id="active-corte">-</div>
+                        </div>
+                      </div>
+                      <hr>
+                      <div class="row text-center">
+                        <div class="col">
+                          <div class="text-success h5 mb-0" id="presentes-count">0</div>
+                          <small class="text-muted">Presentes</small>
+                        </div>
+                        <div class="col">
+                          <div class="text-warning h5 mb-0" id="tardanzas-count">0</div>
+                          <small class="text-muted">Tardanzas</small>
+                        </div>
+                        <div class="col">
+                          <div class="text-danger h5 mb-0" id="ausentes-count">0</div>
+                          <small class="text-muted">Ausentes</small>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Sesiones del día -->
+              <div class="col-md-6">
+                <h6 class="text-muted mb-3">Sesiones de Hoy</h6>
+                <div id="today-sessions" class="list-group" style="max-height: 200px; overflow-y: auto;">
+                  <div class="list-group-item text-center">
+                    <i class="fas fa-spinner fa-spin me-2"></i>
+                    Cargando sesiones...
+                  </div>
+                </div>
+                <div class="mt-2">
+                  <button class="btn btn-danger btn-sm me-2" onclick="disableAllSessions()">
+                    <i class="fas fa-stop me-1"></i>
+                    Finalizar Todas
+                  </button>
+                  <button class="btn btn-outline-primary btn-sm" onclick="refreshSessions()">
+                    <i class="fas fa-sync-alt me-1"></i>
+                    Actualizar
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <!-- Columna izquierda: Video y reconocimiento -->
+      <div class="col-lg-7 mb-4">
+        <div class="card">
+          <div class="card-header bg-dark text-white">
+            <h5 class="mb-0">
+              <i class="fas fa-camera me-2"></i>
+              Reconocimiento Facial en Tiempo Real
+            </h5>
+          </div>
+          <div class="card-body p-0">
+            <div class="video-container">
+              <img src="{{ url_for('video_feed') }}" class="video-feed" id="video-feed" alt="Video en vivo" onerror="handleVideoError()">
+              <div class="recognition-overlay">
+                <span id="recognition-message">Esperando reconocimiento...</span>
+                <div class="db-status" id="db-status">
+                  <i class="fas fa-database"></i> PostgreSQL Conectado
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Información de reconocimiento -->
+        <div class="card mt-3">
+          <div class="card-header bg-info text-white">
+            <h6 class="mb-0">
+              <i class="fas fa-user-check me-2"></i>
+              Estado de Reconocimiento
+            </h6>
+          </div>
+          <div class="card-body">
+            <div id="no-recognition" class="text-center py-3">
+              <i class="fas fa-user-slash fa-2x text-muted mb-2"></i>
+              <p class="text-muted mb-0">Esperando detectar un rostro...</p>
+            </div>
+            <div id="recognition-details" class="d-none">
+              <div class="d-flex align-items-center">
+                <div class="flex-shrink-0">
+                  <i class="fas fa-user-circle fa-3x text-primary"></i>
+                </div>
+                <div class="flex-grow-1 ms-3">
+                  <h6 id="person-name" class="mb-1">-</h6>
+                  <div class="progress mb-2" style="height: 8px;">
+                    <div class="progress-bar bg-success" role="progressbar" style="width: 0%" id="confidence-bar"></div>
+                  </div>
+                  <small class="text-muted" id="confidence-text">Confianza: 0%</small>
+                  <span class="badge ms-2" id="recognition-status-badge"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Columna derecha: Asistencias y controles -->
+      <div class="col-lg-5 mb-4">
+        <!-- Controles de usuario -->
+        <div class="card mb-3">
+          <div class="card-header bg-warning text-dark">
+            <h6 class="mb-0">
+              <i class="fas fa-cogs me-2"></i>
+              Controles del Sistema
+            </h6>
+          </div>
+          <div class="card-body">
+            <div class="d-grid gap-2">
+              <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#registerModal">
+                <i class="fas fa-user-plus me-2"></i>
+                Registrar Nuevo Estudiante
+              </button>
+              <button class="btn btn-outline-secondary" onclick="toggleMode()">
+                <i class="fas fa-exchange-alt me-2"></i>
+                <span id="mode-text">Modo: Asistencia</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Registro de asistencia reciente -->
+        <div class="card">
+          <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+            <h6 class="mb-0">
+              <i class="fas fa-clipboard-list me-2"></i>
+              Asistencias Recientes
+            </h6>
+            <button class="btn btn-sm btn-light" onclick="refreshAttendance()">
+              <i class="fas fa-sync-alt"></i>
+            </button>
+          </div>
+          <div class="card-body p-0">
+            <div class="attendance-table" style="max-height: 400px; overflow-y: auto;">
+              <table class="table table-hover table-sm mb-0">
+                <thead class="table-light sticky-top">
+                  <tr>
+                    <th>Estudiante</th>
+                    <th>Hora</th>
+                    <th>Estado</th>
+                  </tr>
+                </thead>
+                <tbody id="attendance-list">
+                  <tr>
+                    <td colspan="3" class="text-center py-3">
+                      <i class="fas fa-spinner fa-spin me-2"></i>
+                      Cargando asistencias...
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal para registro de usuario -->
+  <div class="modal fade" id="registerModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header bg-primary text-white">
+          <h5 class="modal-title">
+            <i class="fas fa-user-plus me-2"></i>
+            Registrar Nuevo Estudiante
+          </h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="register-form">
+            <div class="row mb-3">
+              <div class="col-md-6">
+                <label for="nombre" class="form-label">Nombre *</label>
+                <input type="text" class="form-control" id="nombre" required>
+              </div>
+              <div class="col-md-6">
+                <label for="apellido" class="form-label">Apellido *</label>
+                <input type="text" class="form-control" id="apellido" required>
+              </div>
+            </div>
+            <div class="mb-3">
+              <label for="email" class="form-label">Email</label>
+              <input type="email" class="form-control" id="email" placeholder="ejemplo@universidad.edu">
+            </div>
+
+            <!-- Captura de fotos -->
+            <div class="mb-3">
+              <label class="form-label">Captura de Fotos (4 requeridas)</label>
+              <div class="capture-section">
+                <div id="capture-status" class="alert alert-info">
+                  <i class="fas fa-info-circle me-2"></i>
+                  Presiona "Capturar Foto" para tomar 4 fotos del estudiante
+                </div>
+                
+                <div class="text-center mb-3">
+                  <button type="button" class="btn btn-warning" id="capture-btn">
+                    <i class="fas fa-camera me-2"></i>
+                    Capturar Foto (<span id="capture-count">0</span>/4)
+                  </button>
+                </div>
+
+                <div id="photos-preview" class="row g-2 d-none">
+                  <!-- Fotos capturadas aparecerán aquí -->
+                </div>
+              </div>
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+          <button type="button" class="btn btn-primary" id="save-user-btn" disabled>
+            <i class="fas fa-save me-2"></i>
+            Guardar Estudiante
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scripts -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+  
+  <script>
+    // Variables globales para el sistema académico
+    let currentAcademicContext = null;
+    let activeSessions = [];
+    let currentMode = 'asistencia';
+
+    // Inicializar la aplicación
+    document.addEventListener('DOMContentLoaded', function() {
+      loadAcademicContext();
+      loadTodaySessions();
+      loadRecentAttendance();
+      updateCurrentTime();
+      setInterval(updateCurrentTime, 1000);
+      setInterval(refreshData, 30000); // Actualizar cada 30 segundos
+    });
+
+    // Cargar contexto académico
+    async function loadAcademicContext() {
+      try {
+        const response = await fetch('/api/academic/context');
+        const data = await response.json();
+        
+        if (data.success) {
+          currentAcademicContext = data.data;
+          updateAcademicDisplay();
+        } else {
+          document.getElementById('current-period').textContent = 'Sin periodo activo';
+        }
+      } catch (error) {
+        console.error('Error cargando contexto académico:', error);
+        document.getElementById('current-period').textContent = 'Error cargando';
+      }
+    }
+
+    // Actualizar display del contexto académico
+    function updateAcademicDisplay() {
+      if (currentAcademicContext) {
+        const periodText = `${currentAcademicContext.periodo_nombre} - ${currentAcademicContext.corte_nombre}`;
+        document.getElementById('current-period').textContent = periodText;
+      }
+    }
+
+    // Cargar sesiones del día
+    async function loadTodaySessions() {
+      try {
+        const response = await fetch('/api/sessions/today');
+        const data = await response.json();
+        
+        if (data.success) {
+          activeSessions = data.data;
+          updateSessionsDisplay();
+          checkActiveSession();
+        }
+      } catch (error) {
+        console.error('Error cargando sesiones:', error);
+      }
+    }
+
+    // Actualizar display de sesiones
+    function updateSessionsDisplay() {
+      const container = document.getElementById('today-sessions');
+      
+      if (activeSessions.length === 0) {
+        container.innerHTML = `
+          <div class="list-group-item text-center text-muted">
+            <i class="fas fa-calendar-times me-2"></i>
+            No hay sesiones programadas para hoy
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = activeSessions.map(session => {
+        const startTime = new Date(`1970-01-01T${session.hora_inicio}`).toLocaleTimeString('es', {hour: '2-digit', minute: '2-digit'});
+        const endTime = new Date(`1970-01-01T${session.hora_fin}`).toLocaleTimeString('es', {hour: '2-digit', minute: '2-digit'});
+        
+        let statusBadge = '';
+        let actionButton = '';
+        
+        if (session.asistencia_habilitada) {
+          statusBadge = '<span class="badge bg-success">Activa</span>';
+          actionButton = `<button class="btn btn-sm btn-outline-danger" onclick="disableSession(${session.sesion_id})">
+                           <i class="fas fa-stop"></i>
+                         </button>`;
+        } else if (session.estado === 'finalizada') {
+          statusBadge = '<span class="badge bg-secondary">Finalizada</span>';
+        } else {
+          statusBadge = '<span class="badge bg-warning">Programada</span>';
+          actionButton = `<button class="btn btn-sm btn-outline-success" onclick="enableSession(${session.sesion_id})">
+                           <i class="fas fa-play"></i>
+                         </button>`;
+        }
+
+        return `
+          <div class="list-group-item d-flex justify-content-between align-items-center">
+            <div>
+              <div class="fw-bold">${session.nombre}</div>
+              <small class="text-muted">${startTime} - ${endTime} | ${session.aula}</small>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              ${statusBadge}
+              ${actionButton}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // Verificar sesión activa
+    async function checkActiveSession() {
+      try {
+        const response = await fetch('/api/sessions/active');
+        const data = await response.json();
+        
+        if (data.success) {
+          updateActiveSessionDisplay(data.data);
+        } else {
+          showNoActiveSession();
+        }
+      } catch (error) {
+        console.error('Error verificando sesión activa:', error);
+        showNoActiveSession();
+      }
+    }
+
+    // Mostrar información de sesión activa
+    function updateActiveSessionDisplay(session) {
+      document.getElementById('no-active-session').classList.add('d-none');
+      document.getElementById('active-session-details').classList.remove('d-none');
+      
+      document.getElementById('active-session-name').textContent = session.nombre;
+      document.getElementById('active-course-name').textContent = `${session.curso_codigo} - ${session.curso_nombre}`;
+      document.getElementById('active-aula').textContent = session.aula;
+      
+      const startTime = new Date(`1970-01-01T${session.hora_inicio}`).toLocaleTimeString('es', {hour: '2-digit', minute: '2-digit'});
+      const endTime = new Date(`1970-01-01T${session.hora_fin}`).toLocaleTimeString('es', {hour: '2-digit', minute: '2-digit'});
+      document.getElementById('active-schedule').textContent = `${startTime} - ${endTime}`;
+      
+      document.getElementById('active-corte').textContent = session.corte_nombre;
+      
+      // Actualizar estadísticas
+      if (session.attendance_stats) {
+        document.getElementById('presentes-count').textContent = session.attendance_stats.presentes;
+        document.getElementById('tardanzas-count').textContent = session.attendance_stats.tardanzas;
+        document.getElementById('ausentes-count').textContent = session.attendance_stats.ausentes;
+      }
+    }
+
+    // Mostrar sin sesión activa
+    function showNoActiveSession() {
+      document.getElementById('no-active-session').classList.remove('d-none');
+      document.getElementById('active-session-details').classList.add('d-none');
+    }
+
+    // Habilitar sesión
+    async function enableSession(sessionId) {
+      try {
+        const response = await fetch(`/api/sessions/${sessionId}/enable`, {
+          method: 'POST'
+        });
+        const data = await response.json();
+        
+        if (data.success) {
+          showAlert('Sesión habilitada correctamente', 'success');
+          refreshSessions();
+          checkActiveSession();
+        } else {
+          showAlert('Error al habilitar sesión', 'danger');
+        }
+      } catch (error) {
+        console.error('Error habilitando sesión:', error);
+        showAlert('Error de conexión', 'danger');
+      }
+    }
+
+    // Deshabilitar todas las sesiones
+    async function disableAllSessions() {
+      if (!confirm('¿Estás seguro de que quieres finalizar todas las sesiones activas?')) {
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/sessions/disable-all', {
+          method: 'POST'
+        });
+        const data = await response.json();
+        
+        if (data.success) {
+          showAlert('Todas las sesiones han sido finalizadas', 'success');
+          refreshSessions();
+          checkActiveSession();
+        } else {
+          showAlert('Error al finalizar sesiones', 'danger');
+        }
+      } catch (error) {
+        console.error('Error finalizando sesiones:', error);
+        showAlert('Error de conexión', 'danger');
+      }
+    }
+
+    // Cargar asistencias recientes
+    async function loadRecentAttendance() {
+      try {
+        const response = await fetch('/api/attendance/recent?limit=10');
+        const data = await response.json();
+        
+        if (data.success) {
+          updateAttendanceDisplay(data.data);
+        }
+      } catch (error) {
+        console.error('Error cargando asistencias:', error);
+      }
+    }
+
+    // Actualizar display de asistencias
+    function updateAttendanceDisplay(attendanceList) {
+      const tbody = document.getElementById('attendance-list');
+      
+      if (attendanceList.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="3" class="text-center py-3 text-muted">
+              <i class="fas fa-inbox me-2"></i>
+              No hay registros de asistencia
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
+      tbody.innerHTML = attendanceList.map(record => {
+        const fecha = new Date(record.fecha_registro);
+        const hora = fecha.toLocaleTimeString('es', {hour: '2-digit', minute: '2-digit'});
+        
+        let estadoBadge = '';
+        if (record.estado === 'presente') {
+          estadoBadge = '<span class="badge bg-success">Presente</span>';
+        } else if (record.estado === 'tardanza') {
+          estadoBadge = `<span class="badge bg-warning">Tardanza ${record.minutos_tardanza}m</span>`;
+        } else {
+          estadoBadge = '<span class="badge bg-danger">Ausente</span>';
+        }
+
+        return `
+          <tr>
+            <td>
+              <div class="fw-bold">${record.estudiante}</div>
+              <small class="text-muted">${record.curso_codigo}</small>
+            </td>
+            <td>${hora}</td>
+            <td>${estadoBadge}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Funciones auxiliares
+    function refreshSessions() {
+      loadTodaySessions();
+    }
+
+    function refreshAttendance() {
+      loadRecentAttendance();
+    }
+
+    function refreshData() {
+      checkActiveSession();
+      loadRecentAttendance();
+    }
+
+    function updateCurrentTime() {
+      const now = new Date();
+      document.getElementById('current-time').textContent = now.toLocaleString('es');
+    }
+
+    function showAlert(message, type = 'info') {
+      // Implementar sistema de alertas
+      const alertDiv = document.createElement('div');
+      alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+      alertDiv.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
+      alertDiv.innerHTML = `
+        ${message}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      `;
+      document.body.appendChild(alertDiv);
+      
+      setTimeout(() => {
+        if (alertDiv.parentNode) {
+          alertDiv.parentNode.removeChild(alertDiv);
+        }
+      }, 5000);
+    }
+
+    // Mantener funciones existentes del sistema original
+    function handleVideoError() {
+      document.getElementById('video-feed').style.display = 'none';
+      document.querySelector('.video-container').innerHTML = `
+        <div class="text-center p-4">
+          <i class="fas fa-video-slash fa-3x text-muted mb-3"></i>
+          <h5>Error de cámara</h5>
+          <p class="text-muted">No se puede conectar con la cámara</p>
+          <button class="btn btn-primary" onclick="location.reload()">
+            <i class="fas fa-sync-alt me-2"></i>Reintentar
+          </button>
+        </div>
+      `;
+    }
+
+    function toggleMode() {
+      // Función para cambiar entre modo asistencia y registro
+      currentMode = currentMode === 'asistencia' ? 'registro' : 'asistencia';
+      document.getElementById('mode-text').textContent = `Modo: ${currentMode.charAt(0).toUpperCase() + currentMode.slice(1)}`;
+    }
+  </script>
+</body>
+</html>
