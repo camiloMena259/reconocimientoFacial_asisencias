@@ -58,30 +58,6 @@ http://127.0.0.1:5000
 
 ## ⚙️ Configuración
 
-### Base de Datos PostgreSQL
-Las configuraciones se encuentran en `app/core/config.py`:
-
-```python
-@dataclass
-class DatabaseConfig:
-    host: str = "localhost"
-    port: int = 5432
-    database: str = "prototipoPG_v2"
-    username: str = "postgres"
-    password: str = "camilomena"
-```
-
-### Variables de Entorno (Opcional)
-Puedes usar variables de entorno para configuración:
-
-```bash
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=prototipoPG_v2
-export DB_USER=postgres
-export DB_PASSWORD=tu_password
-```
-
 ## 🎯 Características Principales
 
 ### ✨ Reconocimiento Facial
