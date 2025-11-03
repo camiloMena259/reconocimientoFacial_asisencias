@@ -1,15 +1,24 @@
 import time
 import threading
 from datetime import datetime
+import sys
+import os
 
 import cv2
 import numpy as np
 import face_recognition
-from flask import Flask, render_template, Response, jsonify
+from flask import Flask, render_template, Response, jsonify, request
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+# Agregar path y importar gestor académico
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from src.utils.gestor_academico_automatico import GestorAcademicoAutomatico
+
 app = Flask(__name__)
+
+# INSTANCIA GLOBAL DEL GESTOR ACADÉMICO
+gestor_academico = GestorAcademicoAutomatico()
 
 # 🔗 CONFIGURACIÓN POSTGRESQL (reemplaza el CSV)
 DATABASE_URL = 'postgresql://postgres:camilomena@localhost:5432/prototipoPG_v2'
@@ -28,6 +37,13 @@ last_recognition_time = 0
 recognition_cooldown = 2  # segundos entre reconocimientos del mismo alumno
 camera_lock = threading.Lock()
 
+# Variables para el modo de registro de usuarios
+current_mode = "asistencia"  # "asistencia" o "registro"
+captured_photos = []  # Lista para almacenar las 4 fotos capturadas
+capture_count = 0  # Contador de fotos capturadas
+registration_status = "idle"  # "idle", "capturing", "preview", "processing"
+reload_embeddings = False  # Señal para recargar embeddings en el hilo principal
+
 # 🧠 CARGAR ROSTROS DESDE POSTGRESQL (reemplaza load_face_encodings)
 def load_face_encodings():
     """Cargar embeddings desde PostgreSQL en lugar de archivos"""
@@ -35,12 +51,15 @@ def load_face_encodings():
     
     db = get_db_session()
     try:
-        # Consultar embeddings de estudiantes activos
+        # Consultar embeddings de estudiantes activos agrupados por usuario
         result = db.execute(text("""
-            SELECT u.nombre, u.apellido, e.embedding_vector 
+            SELECT u.id_usuario, u.nombre, u.apellido, 
+                   array_agg(e.embedding_vector ORDER BY e.quality_score DESC) as embeddings,
+                   COUNT(e.embedding_vector) as num_embeddings
             FROM usuarios u 
             JOIN embeddings_faciales e ON u.id_usuario = e.id_usuario 
-            WHERE u.rol = 'estudiante' AND u.estado = 'activo' AND e.activo = 'true'
+            WHERE u.rol = 'estudiante' AND u.estado = 'activo' AND e.activo = true
+            GROUP BY u.id_usuario, u.nombre, u.apellido
         """)).fetchall()
         
         known_face_encodings = []
@@ -48,21 +67,25 @@ def load_face_encodings():
         
         for row in result:
             try:
-                nombre = row[0]
-                apellido = row[1] 
-                embedding_bytes = row[2]
+                user_id = row[0]
+                nombre = row[1]
+                apellido = row[2] 
+                embeddings_list = row[3]  # Array de embeddings
+                num_embeddings = row[4]
                 
-                # Convertir bytes a numpy array
-                embedding = np.frombuffer(embedding_bytes, dtype=np.float64)
-                
-                known_face_encodings.append(embedding)
-                valid_names.append(f"{nombre} {apellido}")
-                print(f"  ✅ Cargado: {nombre} {apellido}")
+                if embeddings_list and len(embeddings_list) > 0:
+                    # Usar el primer embedding (mejor calidad por el ORDER BY)
+                    embedding_bytes = embeddings_list[0]
+                    embedding = np.frombuffer(embedding_bytes, dtype=np.float64)
+                    
+                    known_face_encodings.append(embedding)
+                    valid_names.append(f"{nombre} {apellido}")
+                    print(f"  ✅ Cargado: {nombre} {apellido} ({num_embeddings} fotos disponibles)")
                 
             except Exception as e:
                 print(f"  ❌ Error procesando {nombre}: {e}")
         
-        print(f"✅ Total de rostros cargados: {len(valid_names)}")
+        print(f"✅ Total de usuarios únicos cargados: {len(valid_names)}")
         return known_face_encodings, valid_names
         
     except Exception as e:
@@ -73,15 +96,27 @@ def load_face_encodings():
 
 known_face_encodings, valid_names = load_face_encodings()
 
-# 📝 REGISTRAR ASISTENCIA EN POSTGRESQL (reemplaza mark_attendance)
+# 📝 REGISTRAR ASISTENCIA COMPLETAMENTE AUTOMÁTICA
 def mark_attendance(name):
-    """Registra la asistencia en PostgreSQL en lugar de CSV"""
+    """
+    Sistema completamente automático:
+    1. Detecta período académico actual
+    2. Busca o crea sesión automáticamente  
+    3. Habilita asistencia automáticamente
+    4. Registra asistencia en el corte correcto
+    """
     global last_recognition_time
 
     try:
         current_time = time.time()
         if current_time - last_recognition_time < recognition_cooldown:
             return False
+
+        # Obtener información académica actual AUTOMÁTICAMENTE
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        print(f"🎯 SISTEMA AUTOMÁTICO - Registrando en: {info_academica['descripcion_periodo']}")
+        print(f"📅 Fecha: {info_academica['fecha_consultada']}")
+        print(f"🗓️ Mes: {info_academica['nombre_mes']}")
 
         db = get_db_session()
         
@@ -93,67 +128,283 @@ def mark_attendance(name):
         
         if not result:
             print(f"❌ Estudiante no encontrado: {name}")
+            db.close()
             return False
         
         id_estudiante = result[0]
+        print(f"👤 Estudiante encontrado: {name} (ID: {id_estudiante})")
         
-        # Obtener sesión activa primero
-        session_result = db.execute(text("""
-            SELECT id_sesion FROM sesiones 
-            WHERE activa = true 
-            ORDER BY fecha_programada DESC 
-            LIMIT 1
-        """)).fetchone()
+        # PASO 1: Buscar sesión del día actual en el corte correcto
+        sesion_activa = gestor_academico.obtener_sesion_activa_actual()
         
-        if not session_result:
-            # Crear sesión automática
-            db.execute(text("""
-                INSERT INTO sesiones (id_curso, nombre, descripcion, fecha_programada, tipo, activa)
-                VALUES (1, 'Sesión Automática', 'Reconocimiento facial', :fecha, 'clase', true)
-            """), {"fecha": datetime.now()})
+        if not sesion_activa:
+            print("🔄 No hay sesión activa, creando sesión automática para el período actual...")
+            
+            # Crear sesión automática en el período correcto
+            from datetime import datetime
+            now = datetime.now()
+            dias = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+            dia_actual = dias[now.weekday()]
+            
+            # Crear sesión en sesiones_academicas (nueva tabla)
+            crear_sesion_query = """
+            INSERT INTO sesiones_academicas (
+                año, semestre, corte, id_curso, numero_sesion, nombre_sesion,
+                descripcion, fecha_programada, hora_inicio, hora_fin, dia_semana,
+                aula, estado, asistencia_habilitada, tolerancia_minutos,
+                duracion_horas, tipo_clase, creada_en
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (año, semestre, corte, id_curso, numero_sesion) 
+            DO UPDATE SET 
+                asistencia_habilitada = EXCLUDED.asistencia_habilitada,
+                estado = EXCLUDED.estado,
+                actualizada_en = CURRENT_TIMESTAMP
+            RETURNING id_sesion;
+            """
+            
+            # Calcular hora de fin (1 hora después)
+            hora_fin = now.replace(hour=min(23, now.hour + 1))
+            
+            # Buscar último número de sesión para generar uno nuevo
+            cursor = db.execute(text("""
+                SELECT COALESCE(MAX(numero_sesion), 0) + 1 
+                FROM sesiones_academicas 
+                WHERE año = :año AND semestre = :semestre AND corte = :corte
+            """), {
+                "año": info_academica['año'],
+                "semestre": info_academica['semestre'], 
+                "corte": info_academica['corte']
+            }).fetchone()
+            
+            numero_sesion = cursor[0] if cursor else 1
+            
+            # Ejecutar creación de sesión
+            result_sesion = db.execute(text(crear_sesion_query), (
+                info_academica['año'],           # año
+                info_academica['semestre'],      # semestre
+                info_academica['corte'],         # corte
+                1,                              # id_curso (por defecto)
+                numero_sesion,                  # numero_sesion
+                f'Sesión Automática - {now.strftime("%d/%m/%Y")}',  # nombre_sesion
+                f'Sesión creada automáticamente por reconocimiento facial',  # descripcion
+                now.date(),                     # fecha_programada
+                now.time(),                     # hora_inicio
+                hora_fin.time(),               # hora_fin
+                dia_actual,                    # dia_semana
+                'Aula Reconocimiento Facial',  # aula
+                'activa',                      # estado
+                True,                          # asistencia_habilitada ¡AUTOMÁTICO!
+                15,                            # tolerancia_minutos
+                1.0,                           # duracion_horas
+                'reconocimiento',              # tipo_clase
+                now                            # creada_en
+            ))
+            
+            id_sesion_nueva = result_sesion.fetchone()[0]
             db.commit()
             
-            session_result = db.execute(text("""
-                SELECT id_sesion FROM sesiones ORDER BY id_sesion DESC LIMIT 1
-            """)).fetchone()
+            print(f"✅ Sesión automática creada: ID {id_sesion_nueva}")
+            print(f"📚 Período: {info_academica['descripcion_periodo']}")
+            print(f"🕐 Horario: {now.strftime('%H:%M')} - {hora_fin.strftime('%H:%M')}")
+            
+            id_sesion_para_asistencia = id_sesion_nueva
+        else:
+            print(f"✅ Sesión encontrada: {sesion_activa['nombre_sesion']}")
+            id_sesion_para_asistencia = sesion_activa['id_sesion']
+            
+            # Si la sesión existe pero no está habilitada, habilitarla AUTOMÁTICAMENTE
+            if not sesion_activa['asistencia_habilitada']:
+                print("🔄 Habilitando asistencia automáticamente...")
+                db.execute(text("""
+                    UPDATE sesiones_academicas 
+                    SET asistencia_habilitada = true,
+                        estado = 'activa',
+                        actualizada_en = CURRENT_TIMESTAMP
+                    WHERE id_sesion = :id_sesion
+                """), {"id_sesion": sesion_activa['id_sesion']})
+                db.commit()
+                print("✅ Asistencia habilitada automáticamente")
         
-        id_sesion = session_result[0]
+        # PASO 2: Verificar si ya registró asistencia
+        verificar_asistencia = db.execute(text("""
+            SELECT id_asistencia, estado, minutos_tardanza 
+            FROM asistencias_academicas 
+            WHERE id_sesion = :id_sesion AND id_estudiante = :id_estudiante
+        """), {
+            "id_sesion": id_sesion_para_asistencia,
+            "id_estudiante": id_estudiante
+        }).fetchone()
         
-        # Verificar si ya registró en esta sesión específica
-        existing = db.execute(text("""
-            SELECT id_asistencia FROM asistencias 
-            WHERE id_estudiante = :id_estudiante 
-            AND id_sesion = :id_sesion
-        """), {"id_estudiante": id_estudiante, "id_sesion": id_sesion}).fetchone()
-        
-        if existing:
-            print(f"⚠️ {name} ya registró asistencia en esta sesión")
+        if verificar_asistencia:
+            print(f"⚠️ {name} ya registró asistencia como: {verificar_asistencia[1]}")
             last_recognition_time = current_time
             db.close()
             return True  # Ya registrado
         
-        # Registrar asistencia (ya tenemos id_sesion del bloque anterior)
+        # PASO 3: Calcular estado (presente/tardanza) automáticamente
+        from datetime import datetime
+        ahora = datetime.now()
+        
+        # Obtener hora de inicio de la sesión
+        sesion_info = db.execute(text("""
+            SELECT hora_inicio, tolerancia_minutos 
+            FROM sesiones_academicas 
+            WHERE id_sesion = :id_sesion
+        """), {"id_sesion": id_sesion_para_asistencia}).fetchone()
+        
+        if sesion_info:
+            hora_inicio_sesion = datetime.combine(ahora.date(), sesion_info[0])
+            tolerancia = sesion_info[1] or 15
+        else:
+            # Si no hay info, usar la hora actual como referencia
+            hora_inicio_sesion = ahora
+            tolerancia = 15
+        
+        diferencia_minutos = (ahora - hora_inicio_sesion).total_seconds() / 60
+        
+        if diferencia_minutos <= tolerancia:
+            estado_asistencia = 'presente'
+            minutos_tardanza = 0
+            print(f"✅ Estado: PRESENTE (llegó {diferencia_minutos:.0f} min después del inicio)")
+        else:
+            estado_asistencia = 'tardanza'
+            minutos_tardanza = int(diferencia_minutos - tolerancia)
+            print(f"⏰ Estado: TARDANZA ({minutos_tardanza} min de retraso)")
+        
+        # PASO 4: Registrar asistencia AUTOMÁTICAMENTE
         db.execute(text("""
-            INSERT INTO asistencias (id_estudiante, id_sesion, fecha_registro, metodo_registro, estado)
-            VALUES (:id_estudiante, :id_sesion, :fecha_registro, :metodo_registro, :estado)
+            INSERT INTO asistencias_academicas (
+                id_sesion, id_estudiante, fecha_registro, metodo_registro,
+                confidence_score, estado, minutos_tardanza
+            ) VALUES (:id_sesion, :id_estudiante, :fecha_registro, :metodo_registro, 
+                     :confidence_score, :estado, :minutos_tardanza)
         """), {
+            "id_sesion": id_sesion_para_asistencia,
             "id_estudiante": id_estudiante,
-            "id_sesion": id_sesion, 
-            "fecha_registro": datetime.now(),
+            "fecha_registro": ahora,
             "metodo_registro": "reconocimiento_facial",
-            "estado": "presente"
+            "confidence_score": None,
+            "estado": estado_asistencia,
+            "minutos_tardanza": minutos_tardanza
         })
         
         db.commit()
         db.close()
         
         last_recognition_time = current_time
-        print(f"✅ Asistencia registrada: {name} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        return False  # Nuevo registro
+        
+        # MENSAJE DE ÉXITO COMPLETO
+        print("="*60)
+        print(f"🎉 ¡ASISTENCIA REGISTRADA AUTOMÁTICAMENTE!")
+        print(f"👤 Estudiante: {name}")
+        print(f"📚 Período: {info_academica['descripcion_periodo']}")
+        print(f"📅 Fecha: {ahora.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"✅ Estado: {estado_asistencia.upper()}")
+        if minutos_tardanza > 0:
+            print(f"⏰ Tardanza: {minutos_tardanza} minutos")
+        print("="*60)
+        
+        return True
         
     except Exception as e:
-        print(f"❌ Error al marcar asistencia: {str(e)}")
+        print(f"❌ Error en sistema automático: {str(e)}")
+        if 'db' in locals():
+            db.close()
         return False
+
+def save_new_user(nombre, apellido, email, photos_data):
+    """Guardar nuevo usuario con sus fotos y embeddings en la base de datos"""
+    try:
+        db = get_db_session()
+        
+        # 1. Insertar usuario
+        # Generar email por defecto si no se proporciona
+        if not email:
+            email = f"{nombre.lower()}.{apellido.lower()}@estudiante.local"
+        
+        # Generar contraseña hash por defecto (se puede cambiar después)
+        default_password_hash = "default_hash_changeme"
+        
+        result = db.execute(text("""
+            INSERT INTO usuarios (nombre, apellido, correo, contrasena_hash, rol, estado)
+            VALUES (:nombre, :apellido, :correo, :contrasena_hash, 'estudiante', 'activo')
+            RETURNING id_usuario
+        """), {
+            "nombre": nombre,
+            "apellido": apellido, 
+            "correo": email,
+            "contrasena_hash": default_password_hash
+        })
+        
+        user_id = result.fetchone()[0]
+        
+        # 2. Procesar fotos y generar embeddings
+        embeddings_saved = 0
+        for i, photo_bytes in enumerate(photos_data):
+            try:
+                # Convertir bytes a numpy array (imagen)
+                nparr = np.frombuffer(photo_bytes, np.uint8)
+                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                
+                # Generar embedding
+                face_locations = face_recognition.face_locations(rgb_image)
+                print(f"  📸 Foto {i+1}: Encontradas {len(face_locations)} caras")
+                
+                if len(face_locations) > 0:
+                    face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+                    print(f"  🧠 Foto {i+1}: Generados {len(face_encodings)} embeddings")
+                    
+                    if len(face_encodings) > 0:
+                        embedding = face_encodings[0]
+                        embedding_bytes = embedding.tobytes()
+                        
+                        # Guardar embedding en BD
+                        db.execute(text("""
+                            INSERT INTO embeddings_faciales (id_usuario, embedding_vector, quality_score, detection_confidence, activo)
+                            VALUES (:id_usuario, :embedding_vector, :quality_score, :detection_confidence, true)
+                        """), {
+                            "id_usuario": user_id,
+                            "embedding_vector": embedding_bytes,
+                            "quality_score": 0.85,  # Valor por defecto
+                            "detection_confidence": 0.90  # Valor por defecto
+                        })
+                        
+                        embeddings_saved += 1
+                        print(f"✅ Embedding {i+1} guardado para {nombre} {apellido}")
+                    else:
+                        print(f"⚠️ Foto {i+1}: No se pudieron generar embeddings")
+                else:
+                    print(f"⚠️ Foto {i+1}: No se encontraron caras en la imagen")
+                
+            except Exception as e:
+                print(f"❌ Error procesando foto {i+1}: {e}")
+                # En caso de error, hacer rollback de la transacción
+                if 'db' in locals():
+                    db.rollback()
+        
+        if embeddings_saved > 0:
+            db.commit()
+            print(f"✅ Usuario {nombre} {apellido} registrado con {embeddings_saved} embeddings")
+            
+            # Señalar al hilo principal que recargue embeddings
+            global reload_embeddings
+            reload_embeddings = True
+            print("📡 Señal de recarga enviada al hilo de reconocimiento")
+            
+            db.close()
+            return True, f"Usuario registrado exitosamente con {embeddings_saved} fotos"
+        else:
+            db.rollback()
+            db.close()
+            return False, "No se pudo generar ningún embedding válido. Asegúrate de que las fotos muestren claramente el rostro."
+            
+    except Exception as e:
+        print(f"❌ Error guardando usuario: {e}")
+        if 'db' in locals():
+            db.rollback()
+            db.close()
+        return False, f"Error: {str(e)}"
 
 def release_camera():
     """Libera los recursos de la cámara si está activa."""
@@ -166,7 +417,7 @@ def release_camera():
 
 def facial_recognition_thread():
     """Función que se ejecuta en un hilo separado para el reconocimiento facial."""
-    global global_frame, recognized_person, camera_active
+    global global_frame, recognized_person, camera_active, current_mode, captured_photos, capture_count, registration_status, reload_embeddings
 
     print("🎥 Iniciando hilo de reconocimiento facial...")
     
@@ -212,6 +463,13 @@ def facial_recognition_thread():
 
     try:
         while camera_active:
+            # Verificar si necesitamos recargar embeddings
+            if reload_embeddings:
+                print("🔄 Recargando embeddings por nuevo registro...")
+                known_face_encodings, valid_names = load_face_encodings()
+                reload_embeddings = False
+                print(f"✅ Embeddings recargados: {len(valid_names)} usuarios disponibles")
+
             ret, frame = cap.read()
             if not ret:
                 print("❌ Error al leer frame de la cámara")
@@ -220,9 +478,27 @@ def facial_recognition_thread():
             # Crear una copia para mostrar
             display_frame = frame.copy()
 
-            # Procesar cada X frames
+            # Mostrar información del modo actual
+            if current_mode == "registro":
+                cv2.putText(display_frame, f"MODO REGISTRO - Fotos: {capture_count}/4", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # En modo registro, solo mostrar el frame sin procesar
+                if registration_status == "capturing":
+                    # Mostrar indicador de captura
+                    cv2.putText(display_frame, "Presiona CAPTURAR cuando estes listo", 
+                               (10, display_frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                elif registration_status == "preview":
+                    cv2.putText(display_frame, "Revisa las fotos y confirma registro", 
+                               (10, display_frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            else:
+                # Modo asistencia normal - procesar reconocimiento
+                cv2.putText(display_frame, "MODO ASISTENCIA", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Procesar cada X frames (solo en modo asistencia)
             frame_count += 1
-            if frame_count % FRAME_SKIP == 0:
+            if frame_count % FRAME_SKIP == 0 and current_mode == "asistencia":
                 # Redimensionar para mejor rendimiento
                 small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
                 rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
@@ -249,8 +525,6 @@ def facial_recognition_thread():
                         best_distance = face_distances[best_match_index]
                         confidence = 1 - best_distance
                         
-
-
                         if matches and matches[best_match_index]:
                             name = valid_names[best_match_index]
                             
@@ -350,26 +624,49 @@ def video_feed():
 
 @app.route('/get_attendance')
 def get_attendance():
-    """Obtener asistencias desde PostgreSQL (reemplaza CSV)"""
+    """Obtener asistencias desde la nueva tabla asistencias_academicas"""
     try:
         db = get_db_session()
         
-        # Obtener asistencias de hoy
+        # Obtener información académica actual para mostrar contexto
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        
+        # Obtener asistencias de hoy de la nueva tabla
         today = datetime.now().date()
         result = db.execute(text("""
-            SELECT u.nombre, u.apellido, a.fecha_registro, a.estado
-            FROM asistencias a
-            JOIN usuarios u ON a.id_estudiante = u.id_usuario
-            WHERE DATE(a.fecha_registro) = :today
-            ORDER BY a.fecha_registro DESC
+            SELECT 
+                u.nombre, 
+                u.apellido, 
+                aa.fecha_registro, 
+                aa.estado, 
+                aa.minutos_tardanza,
+                sa.nombre_sesion,
+                sa.corte,
+                sa.semestre
+            FROM asistencias_academicas aa
+            JOIN usuarios u ON aa.id_estudiante = u.id_usuario
+            JOIN sesiones_academicas sa ON aa.id_sesion = sa.id_sesion
+            WHERE DATE(aa.fecha_registro) = :today
+            ORDER BY aa.fecha_registro DESC
         """), {"today": today}).fetchall()
         
         records = []
         for row in result:
+            # Formatear estado con emoji
+            estado_display = row[3]
+            if row[3] == 'presente':
+                estado_display = '✅ Presente'
+            elif row[3] == 'tardanza':
+                estado_display = f'⏰ Tardanza ({row[4]} min)'
+            elif row[3] == 'ausente':
+                estado_display = '❌ Ausente'
+            
             records.append({
                 'Nombre': f"{row[0]} {row[1]}",
                 'Fecha': row[2].strftime('%Y-%m-%d %H:%M:%S') if row[2] else '',
-                'Estado': row[3]
+                'Estado': estado_display,
+                'Sesion': row[5] or 'Sin sesión',
+                'Periodo': f"{row[7]} - Corte {row[6]}"
             })
         
         db.close()
@@ -381,13 +678,258 @@ def get_attendance():
 
 @app.route('/recognition_status')
 def recognition_status():
-    """Estado del reconocimiento"""
+    """Estado del reconocimiento con estadísticas actualizadas"""
     global recognized_person, camera_active
-    return jsonify({
-        'person': recognized_person,
-        'camera_active': camera_active,
-        'faces_loaded': len(valid_names)
-    })
+    
+    # Obtener estadísticas de hoy
+    try:
+        db = get_db_session()
+        today = datetime.now().date()
+        
+        # Contar asistencias de hoy
+        asistencias_hoy = db.execute(text("""
+            SELECT COUNT(*) FROM asistencias_academicas aa
+            JOIN sesiones_academicas sa ON aa.id_sesion = sa.id_sesion
+            WHERE DATE(aa.fecha_registro) = :today
+        """), {"today": today}).fetchone()[0]
+        
+        # Contar total de estudiantes
+        total_estudiantes = db.execute(text("""
+            SELECT COUNT(*) FROM usuarios WHERE rol = 'estudiante'
+        """)).fetchone()[0]
+        
+        # Obtener información académica actual
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        
+        db.close()
+        
+        return jsonify({
+            'person': recognized_person,
+            'camera_active': camera_active,
+            'faces_loaded': len(valid_names),
+            'asistencias_hoy': asistencias_hoy,
+            'total_estudiantes': total_estudiantes,
+            'periodo_academico': info_academica['descripcion_periodo'],
+            'fecha_actual': info_academica['fecha_consultada']
+        })
+        
+    except Exception as e:
+        print(f"❌ Error obteniendo estadísticas: {e}")
+        return jsonify({
+            'person': recognized_person,
+            'camera_active': camera_active,
+            'faces_loaded': len(valid_names),
+            'asistencias_hoy': 0,
+            'total_estudiantes': 0,
+            'periodo_academico': 'Error',
+            'fecha_actual': 'Error'
+        })
+
+@app.route('/toggle_mode', methods=['POST'])
+def toggle_mode():
+    """Cambiar entre modo asistencia y registro"""
+    global current_mode, captured_photos, capture_count, registration_status
+    
+    data = request.get_json()
+    new_mode = data.get('mode', 'asistencia')
+    
+    if new_mode in ['asistencia', 'registro']:
+        current_mode = new_mode
+        
+        # Limpiar estado si cambia a modo registro
+        if new_mode == "registro":
+            captured_photos = []
+            capture_count = 0
+            registration_status = "capturing"
+        else:
+            registration_status = "idle"
+        
+        return jsonify({
+            'success': True, 
+            'current_mode': current_mode,
+            'message': f'Cambiado a modo {new_mode}'
+        })
+    else:
+        return jsonify({'success': False, 'message': 'Modo inválido'})
+
+@app.route('/capture_photo', methods=['POST'])
+def capture_photo():
+    """Capturar una foto del frame actual para registro"""
+    global global_frame, captured_photos, capture_count, registration_status
+    
+    if current_mode != "registro":
+        return jsonify({'success': False, 'message': 'No estás en modo registro'})
+    
+    if capture_count >= 4:
+        return jsonify({'success': False, 'message': 'Ya capturaste 4 fotos'})
+    
+    if global_frame is None:
+        return jsonify({'success': False, 'message': 'No hay frame disponible'})
+    
+    try:
+        # Guardar el frame actual
+        captured_photos.append(global_frame)
+        capture_count += 1
+        
+        # Si ya tenemos 4 fotos, cambiar a modo preview
+        if capture_count >= 4:
+            registration_status = "preview"
+        
+        return jsonify({
+            'success': True, 
+            'capture_count': capture_count,
+            'total_needed': 4,
+            'status': registration_status,
+            'message': f'Foto {capture_count}/4 capturada'
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+@app.route('/get_captured_photos')
+def get_captured_photos():
+    """Obtener las fotos capturadas para preview"""
+    global captured_photos, capture_count
+    
+    try:
+        # Convertir cada foto a base64 para enviar al frontend
+        import base64
+        photos_b64 = []
+        
+        for photo_bytes in captured_photos:
+            b64_string = base64.b64encode(photo_bytes).decode('utf-8')
+            photos_b64.append(f"data:image/jpeg;base64,{b64_string}")
+        
+        return jsonify({
+            'success': True,
+            'photos': photos_b64,
+            'count': capture_count
+        })
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+@app.route('/save_user', methods=['POST'])
+def save_user():
+    """Guardar nuevo usuario con sus fotos"""
+    global captured_photos, current_mode, capture_count, registration_status
+    
+    if current_mode != "registro":
+        return jsonify({'success': False, 'message': 'No estás en modo registro'})
+    
+    if len(captured_photos) != 4:
+        return jsonify({'success': False, 'message': 'Necesitas exactamente 4 fotos'})
+    
+    try:
+        data = request.get_json()
+        nombre = data.get('nombre', '').strip()
+        apellido = data.get('apellido', '').strip()
+        email = data.get('email', '').strip()
+        
+        # Validaciones básicas
+        if not nombre or not apellido:
+            return jsonify({'success': False, 'message': 'Nombre y apellido son requeridos'})
+        
+        if email and '@' not in email:
+            return jsonify({'success': False, 'message': 'Email inválido'})
+        
+        registration_status = "processing"
+        
+        # Guardar usuario
+        success, message = save_new_user(nombre, apellido, email, captured_photos)
+        
+        if success:
+            # Limpiar estado y volver a modo asistencia
+            captured_photos = []
+            capture_count = 0
+            current_mode = "asistencia"
+            registration_status = "idle"
+            
+            return jsonify({
+                'success': True, 
+                'message': message,
+                'redirect': True
+            })
+        else:
+            registration_status = "preview"  # Volver a preview para reintentar
+            return jsonify({'success': False, 'message': message})
+    
+    except Exception as e:
+        registration_status = "preview"
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
+
+# 🎯 NUEVAS RUTAS DEL SISTEMA ACADÉMICO AUTOMÁTICO
+
+@app.route('/get_session_info')
+def get_session_info():
+    """
+    Obtiene información de la sesión actual para mostrar en la interfaz
+    """
+    try:
+        info_academica = gestor_academico.obtener_info_academica_completa()
+        sesion_activa = gestor_academico.obtener_sesion_activa_actual()
+        
+        return jsonify({
+            'success': True,
+            'periodo_academico': info_academica['descripcion_periodo'],
+            'fecha_actual': info_academica['fecha_consultada'],
+            'mes_actual': info_academica['nombre_mes'],
+            'sesion_activa': sesion_activa is not None,
+            'info_sesion': sesion_activa if sesion_activa else None
+        })
+    except Exception as e:
+        print(f"❌ Error obteniendo info de sesión: {e}")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/toggle_asistencia', methods=['GET', 'POST'])
+def toggle_asistencia():
+    """
+    Habilita o deshabilita la asistencia para la sesión actual
+    """
+    try:
+        resultado = gestor_academico.habilitar_asistencia_automatica()
+        
+        return jsonify({
+            'success': resultado['exito'],
+            'message': resultado['mensaje'],
+            'session_info': resultado.get('sesion', {})
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        })
+
+@app.route('/estadisticas_corte')
+def estadisticas_corte():
+    """
+    Obtiene estadísticas del corte académico actual
+    """
+    try:
+        stats = gestor_academico.obtener_estadisticas_corte_actual()
+        
+        return jsonify({
+            'success': True,
+            'estadisticas': stats
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        })
+
+@app.route('/reset_registration', methods=['POST'])
+def reset_registration():
+    """Reiniciar el proceso de registro"""
+    global captured_photos, capture_count, registration_status
+    
+    captured_photos = []
+    capture_count = 0 
+    registration_status = "capturing"
+    
+    return jsonify({'success': True, 'message': 'Registro reiniciado'})
 
 if __name__ == '__main__':
     print("🚀 === TU SISTEMA DE RECONOCIMIENTO FACIAL + POSTGRESQL ===")
